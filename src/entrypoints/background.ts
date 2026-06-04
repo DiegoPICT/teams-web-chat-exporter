@@ -13,8 +13,16 @@ import {
   type BundleFailure,
 } from '../background/download';
 import { revokeDownloadUrl, textToDownloadUrl } from '../background/builders';
-import { ACTIVE_EXPORTS_STORAGE_KEY, FIRST_INSTALL_STORAGE_KEY, appendHistoryEntry } from '../utils/options';
-import type { BackgroundIncomingMessage } from '../types/messaging';
+import {
+    ACTIVE_EXPORTS_STORAGE_KEY,
+    DEFAULT_MCP_BRIDGE_URL,
+    DEFAULT_OPTIONS,
+    FIRST_INSTALL_STORAGE_KEY,
+    appendHistoryEntry,
+    isValidMcpBridgeUrl,
+    loadOptions,
+} from '../utils/options';
+import type { BackgroundIncomingMessage, McpConnectionState, McpStatusPayload } from '../types/messaging';
 import type {
   ActiveExportInfo,
   BuildOptions,
@@ -511,6 +519,365 @@ function defaultContextError(options: ScrapeOptions) {
     return options?.exportTarget === 'team'
         ? 'Open a team channel before exporting.'
         : 'Open a chat conversation before exporting.';
+}
+
+const MCP_PROTOCOL_ID = 'teams-exporter-bridge/v1';
+const MCP_CHUNK_SIZE = 200;
+type McpActiveOp = { requestId: string; type: 'LIST_CONVERSATIONS' | 'START_SNAPSHOT'; cancelled: boolean };
+type McpBridgeFrame = {
+    v?: string;
+    type?: string;
+    sessionId?: string;
+    requestId?: string;
+    ts?: number;
+    payload?: unknown;
+    error?: string;
+};
+
+let mcpSocket: WebSocket | null = null;
+let mcpState: McpConnectionState = 'DISCONNECTED';
+let mcpSessionId: string | null = null;
+let mcpBridgeUrl = DEFAULT_MCP_BRIDGE_URL;
+let mcpIntentionalClose = false;
+let mcpBoundTabId: number | null = null;
+let mcpBoundConversationId: string | null = null;
+let mcpBoundConversationTitle: string | null = null;
+let mcpLastError: string | null = null;
+let mcpActiveOperation: McpActiveOp | null = null;
+
+function makeMcpSessionId(): string {
+    try {
+        const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+        if (c?.randomUUID) return c.randomUUID();
+    } catch { /* fall through */ }
+    return `mcp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getMcpStatusPayload(): McpStatusPayload {
+    return {
+        state: mcpState,
+        bridgeUrl: mcpBridgeUrl,
+        connected: mcpSocket?.readyState === WebSocket.OPEN,
+        sessionId: mcpSessionId || undefined,
+        tabId: mcpBoundTabId ?? undefined,
+        conversationId: mcpBoundConversationId || undefined,
+        conversationTitle: mcpBoundConversationTitle || undefined,
+        lastError: mcpLastError || undefined,
+    };
+}
+
+function broadcastMcpStatus() {
+    try {
+        const p = runtime.sendMessage({ type: 'MCP_STATUS_UPDATE', payload: getMcpStatusPayload() });
+        if (p && p.catch) p.catch(() => { });
+    } catch { /* popup may be closed */ }
+}
+
+function setMcpState(next: McpConnectionState, errorText?: string | null) {
+    mcpState = next;
+    if (typeof errorText === 'string') mcpLastError = errorText;
+    if (errorText === null) mcpLastError = null;
+    broadcastMcpStatus();
+}
+
+function clearMcpOperation() {
+    mcpActiveOperation = null;
+    if (mcpSocket?.readyState === WebSocket.OPEN) {
+        setMcpState('CONNECTED_IDLE');
+    }
+}
+
+function mcpSendFrame(type: string, requestId?: string, payload?: unknown, error?: string) {
+    if (!mcpSocket || mcpSocket.readyState !== WebSocket.OPEN) return;
+    const frame: McpBridgeFrame = {
+        v: MCP_PROTOCOL_ID,
+        type,
+        sessionId: mcpSessionId || undefined,
+        requestId,
+        ts: Date.now(),
+        payload,
+        error,
+    };
+    try {
+        mcpSocket.send(JSON.stringify(frame));
+    } catch (e: any) {
+        setMcpState('ERROR', e?.message || String(e));
+    }
+}
+
+function mcpSendError(requestId: string | undefined, message: string, code?: string) {
+    const payload = code ? { code } : undefined;
+    mcpSendFrame('ERROR', requestId, payload, message);
+}
+
+async function isMcpScopeValid(): Promise<boolean> {
+    if (mcpBoundTabId == null || !mcpBoundConversationId) return false;
+    try {
+        const tab = await tabs.get(mcpBoundTabId);
+        if (!tab || !isTeamsUrl(tab.url)) return false;
+        await ensureContentScript(mcpBoundTabId);
+        const currentConvId = await getConvIdForTab(mcpBoundTabId);
+        return currentConvId === mcpBoundConversationId;
+    } catch {
+        return false;
+    }
+}
+
+async function requireMcpScope(requestId?: string): Promise<boolean> {
+    const ok = await isMcpScopeValid();
+    if (ok) return true;
+    clearMcpOperation();
+    setMcpState('CONTEXT_LOST', 'Bound Teams scope is no longer active. Reconnect MCP from the popup.');
+    mcpSendError(requestId, 'Bound Teams scope is no longer active', 'CONTEXT_LOST');
+    return false;
+}
+
+function resetMcpSessionState() {
+    mcpSocket = null;
+    mcpActiveOperation = null;
+    mcpSessionId = null;
+    mcpBoundTabId = null;
+    mcpBoundConversationId = null;
+    mcpBoundConversationTitle = null;
+}
+
+function disconnectMcp(reason?: string | null) {
+    if (mcpSocket) {
+        mcpIntentionalClose = true;
+        try { mcpSocket.close(1000, 'client-disconnect'); } catch { /* noop */ }
+    }
+    resetMcpSessionState();
+    setMcpState('DISCONNECTED', reason ?? null);
+}
+
+function cancelMcpActiveSnapshot() {
+    if (!mcpActiveOperation || mcpActiveOperation.type !== 'START_SNAPSHOT') return;
+    mcpActiveOperation.cancelled = true;
+    if (typeof mcpBoundTabId === 'number') {
+        void sendMessageToTab(mcpBoundTabId, { type: 'STOP_SCRAPE' }).catch(() => { });
+        void abortFetchesForTab(mcpBoundTabId);
+        for (const [requestId, pending] of pendingScrapes) {
+            if (requestId.startsWith(`${mcpBoundTabId}-`)) {
+                pendingScrapes.delete(requestId);
+                pending.reject(new Error('cancelled'));
+            }
+        }
+    }
+}
+
+async function handleMcpListConversations(requestId?: string) {
+    if (mcpActiveOperation) {
+        mcpSendError(requestId, 'Another operation is already running', 'BUSY');
+        return;
+    }
+    if (!(await requireMcpScope(requestId))) return;
+    const tabId = mcpBoundTabId;
+    if (typeof tabId !== 'number') {
+        mcpSendError(requestId, 'Missing bound tab', 'CONTEXT_LOST');
+        return;
+    }
+
+    mcpActiveOperation = { requestId: requestId || makeMcpSessionId(), type: 'LIST_CONVERSATIONS', cancelled: false };
+    setMcpState('BUSY');
+    try {
+        await ensureContentScript(tabId);
+        const resp = await sendMessageToTab(tabId, { type: 'LIST_CONVERSATIONS' });
+        if (!resp?.ok || !Array.isArray(resp?.conversations)) {
+            mcpSendError(requestId, resp?.error || 'LIST_CONVERSATIONS failed');
+            return;
+        }
+        mcpSendFrame('CONVERSATIONS', requestId, {
+            conversations: resp.conversations,
+            folders: Array.isArray(resp.folders) ? resp.folders : [],
+        });
+    } catch (e: any) {
+        mcpSendError(requestId, e?.message || String(e));
+    } finally {
+        clearMcpOperation();
+    }
+}
+
+async function handleMcpStartSnapshot(requestId?: string, payload?: unknown) {
+    if (mcpActiveOperation) {
+        mcpSendError(requestId, 'Another operation is already running', 'BUSY');
+        return;
+    }
+    if (!(await requireMcpScope(requestId))) return;
+    const tabId = mcpBoundTabId;
+    const conversationId = mcpBoundConversationId;
+    if (typeof tabId !== 'number' || !conversationId) {
+        mcpSendError(requestId, 'Missing bound Teams scope', 'CONTEXT_LOST');
+        return;
+    }
+
+    const req = (payload && typeof payload === 'object') ? payload as Record<string, unknown> : {};
+    const opId = requestId || makeMcpSessionId();
+    mcpActiveOperation = { requestId: opId, type: 'START_SNAPSHOT', cancelled: false };
+    setMcpState('BUSY');
+
+    try {
+        const opts = await loadOptions(storage, DEFAULT_OPTIONS);
+        const scrapeOptions: ScrapeOptions = {
+            startAt: typeof req.startAt === 'string' ? req.startAt : (opts.startAtISO || null),
+            endAt: typeof req.endAt === 'string' ? req.endAt : (opts.endAtISO || null),
+            includeReplies: typeof req.includeReplies === 'boolean' ? req.includeReplies : opts.includeReplies,
+            includeReactions: typeof req.includeReactions === 'boolean' ? req.includeReactions : opts.includeReactions,
+            includeSystem: typeof req.includeSystem === 'boolean' ? req.includeSystem : opts.includeSystem,
+            showHud: false,
+            exportTarget: 'chat',
+            formats: ['json'],
+            embedAvatars: false,
+            downloadImages: false,
+            conversationId,
+            conversationTitle: mcpBoundConversationTitle,
+        };
+
+        const scrapeRes = await requestScrape(tabId, scrapeOptions);
+        if (mcpActiveOperation?.requestId !== opId || mcpActiveOperation.cancelled) {
+            mcpSendFrame('DONE', requestId, { cancelled: true, reason: 'cancelled' });
+            return;
+        }
+
+        const messages = Array.isArray(scrapeRes.messages) ? scrapeRes.messages : [];
+        const totalChunks = Math.ceil(messages.length / MCP_CHUNK_SIZE);
+        mcpSendFrame('SNAPSHOT_STARTED', requestId, {
+            count: messages.length,
+            chunks: totalChunks,
+            conversationId,
+            conversationTitle: mcpBoundConversationTitle,
+        });
+
+        for (let i = 0; i < totalChunks; i++) {
+            if (mcpActiveOperation?.requestId !== opId || mcpActiveOperation.cancelled) {
+                mcpSendFrame('DONE', requestId, { cancelled: true, reason: 'cancelled' });
+                return;
+            }
+            const start = i * MCP_CHUNK_SIZE;
+            const chunk = messages.slice(start, start + MCP_CHUNK_SIZE);
+            mcpSendFrame('CHUNK', requestId, {
+                index: i,
+                totalChunks,
+                messages: chunk,
+            });
+        }
+        mcpSendFrame('DONE', requestId, { count: messages.length });
+    } catch (e: any) {
+        const message = e?.message || String(e);
+        if (message === 'cancelled' || mcpActiveOperation?.cancelled) {
+            mcpSendFrame('DONE', requestId, { cancelled: true, reason: 'cancelled' });
+        } else {
+            mcpSendError(requestId, message);
+        }
+    } finally {
+        clearMcpOperation();
+    }
+}
+
+function handleMcpSocketMessage(raw: unknown) {
+    let frame: McpBridgeFrame;
+    try {
+        const text = typeof raw === 'string' ? raw : String(raw);
+        frame = JSON.parse(text) as McpBridgeFrame;
+    } catch {
+        mcpSendError(undefined, 'Invalid JSON frame');
+        return;
+    }
+    const type = typeof frame.type === 'string' ? frame.type : '';
+    const requestId = typeof frame.requestId === 'string' ? frame.requestId : undefined;
+    if (!type) {
+        mcpSendError(requestId, 'Missing frame type');
+        return;
+    }
+
+    if (type === 'HELLO_ACK') return;
+    if (type === 'CANCEL') {
+        if (mcpActiveOperation?.type === 'START_SNAPSHOT') {
+            cancelMcpActiveSnapshot();
+        } else {
+            mcpSendFrame('DONE', requestId, { cancelled: true, reason: 'cancelled' });
+        }
+        return;
+    }
+    if (type === 'LIST_CONVERSATIONS') {
+        void handleMcpListConversations(requestId);
+        return;
+    }
+    if (type === 'START_SNAPSHOT') {
+        void handleMcpStartSnapshot(requestId, frame.payload);
+        return;
+    }
+    mcpSendError(requestId, `Unsupported frame type: ${type}`, 'UNSUPPORTED');
+}
+
+async function connectMcpBridge(bridgeUrl: string, tabId: number, conversationId: string, conversationTitle?: string | null): Promise<void> {
+    if (!isValidMcpBridgeUrl(bridgeUrl)) {
+        throw new Error('Bridge URL must be a local ws:// loopback endpoint');
+    }
+    await ensureContentScript(tabId);
+    disconnectMcp(null);
+    mcpBridgeUrl = bridgeUrl;
+    mcpBoundTabId = tabId;
+    mcpBoundConversationId = conversationId;
+    mcpBoundConversationTitle = conversationTitle || null;
+    mcpSessionId = makeMcpSessionId();
+    mcpIntentionalClose = false;
+    mcpLastError = null;
+    setMcpState('CONNECTING');
+
+    await new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(bridgeUrl);
+        let settled = false;
+        const finish = (err?: Error) => {
+            if (settled) return;
+            settled = true;
+            if (err) reject(err);
+            else resolve();
+        };
+        ws.onopen = () => {
+            mcpSocket = ws;
+            ws.send(JSON.stringify({
+                v: MCP_PROTOCOL_ID,
+                type: 'HELLO',
+                sessionId: mcpSessionId || undefined,
+                ts: Date.now(),
+                payload: {
+                    protocol: MCP_PROTOCOL_ID,
+                    tabId,
+                    conversationId,
+                    conversationTitle: conversationTitle || undefined,
+                },
+            }));
+            setMcpState('CONNECTED_IDLE');
+            finish();
+        };
+        ws.onerror = () => {
+            if (!settled) {
+                setMcpState('ERROR', 'Unable to connect to MCP bridge');
+                finish(new Error('Unable to connect to MCP bridge'));
+                return;
+            }
+            setMcpState('ERROR', 'MCP bridge transport error');
+        };
+        ws.onclose = (event) => {
+            const reason = event.reason || `closed (${event.code})`;
+            const intentional = mcpIntentionalClose;
+            mcpIntentionalClose = false;
+            resetMcpSessionState();
+            if (!settled) {
+                setMcpState('ERROR', reason);
+                finish(new Error(`MCP socket closed during connect: ${reason}`));
+                return;
+            }
+            if (intentional) {
+                setMcpState('DISCONNECTED', null);
+                return;
+            }
+            setMcpState('DISCONNECTED', reason);
+        };
+        ws.onmessage = (event) => {
+            handleMcpSocketMessage(event.data);
+        };
+    });
 }
 
 // Debug: track broadcastStatus call rate so we can correlate the popup
@@ -1596,6 +1963,53 @@ runtime.onMessage.addListener((msg: BackgroundIncomingMessage, sender, sendRespo
                 });
             }
             sendResponse({ ok: true, results, totalMs: Date.now() - t0 });
+        })();
+        return true;
+    }
+
+    if (msg.type === 'MCP_STATUS') {
+        sendResponse({ ok: true, status: getMcpStatusPayload() });
+        return;
+    }
+
+    if (msg.type === 'MCP_DISCONNECT') {
+        cancelMcpActiveSnapshot();
+        disconnectMcp(null);
+        sendResponse({ ok: true, status: getMcpStatusPayload() });
+        return;
+    }
+
+    if (msg.type === 'MCP_CONNECT') {
+        (async () => {
+            const data = msg.data || {};
+            const tabId = typeof data.tabId === 'number' ? data.tabId : sender?.tab?.id;
+            const conversationId = typeof data.conversationId === 'string' && data.conversationId.trim()
+                ? data.conversationId.trim()
+                : null;
+            const conversationTitle = typeof data.conversationTitle === 'string' ? data.conversationTitle : null;
+            const bridgeUrl = typeof data.bridgeUrl === 'string' && data.bridgeUrl.trim()
+                ? data.bridgeUrl.trim()
+                : DEFAULT_MCP_BRIDGE_URL;
+
+            if (typeof tabId !== 'number') {
+                sendResponse({ ok: false, error: 'Missing tabId', status: getMcpStatusPayload() });
+                return;
+            }
+            if (!conversationId) {
+                sendResponse({ ok: false, error: 'Missing conversationId', status: getMcpStatusPayload() });
+                return;
+            }
+            if (!isValidMcpBridgeUrl(bridgeUrl)) {
+                sendResponse({ ok: false, error: 'Bridge URL must be a local ws:// loopback endpoint', status: getMcpStatusPayload() });
+                return;
+            }
+
+            try {
+                await connectMcpBridge(bridgeUrl, tabId, conversationId, conversationTitle);
+                sendResponse({ ok: true, status: getMcpStatusPayload() });
+            } catch (e: any) {
+                sendResponse({ ok: false, error: e?.message || String(e), status: getMcpStatusPayload() });
+            }
         })();
         return true;
     }

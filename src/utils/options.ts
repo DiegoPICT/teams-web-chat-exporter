@@ -4,6 +4,7 @@ import type { HistoryEntry } from '../types/shared';
 export type OptionFormat = 'json' | 'csv' | 'html' | 'txt' | 'pdf';
 export type Theme = 'light' | 'dark';
 export type ExportTarget = 'chat' | 'team';
+export const DEFAULT_MCP_BRIDGE_URL = 'ws://127.0.0.1:8765/ws';
 // What the extension does automatically after a successful export:
 // 'manual' -> the post-export tile shows Open/Show buttons; nothing else
 //             happens until the user clicks. (default; labelled "Let me
@@ -88,6 +89,24 @@ export type Options = {
   // so logs survive service-worker eviction. Off by default; users who
   // want richer support data enable it via the Diagnostics page.
   diagLogPersist: boolean;
+  // Local bridge endpoint for the optional MCP websocket client.
+  // v1 is intentionally local-only (loopback ws:// host).
+  mcpBridgeUrl: string;
+};
+
+const isLoopbackHost = (host: string): boolean => {
+  const normalized = host.trim().toLowerCase();
+  return normalized === '127.0.0.1' || normalized === 'localhost' || normalized === '::1';
+};
+
+export const isValidMcpBridgeUrl = (raw: unknown): raw is string => {
+  if (typeof raw !== 'string') return false;
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'ws:' && isLoopbackHost(parsed.hostname);
+  } catch {
+    return false;
+  }
 };
 
 // Storage shape kept compatible with the pre-multi-format release: older
@@ -187,6 +206,7 @@ export const DEFAULT_OPTIONS: Options = {
   onboardingDismissed: false,
   imageFetchFallback: false,
   diagLogPersist: false,
+  mcpBridgeUrl: DEFAULT_MCP_BRIDGE_URL,
 };
 
 const VALID_FORMATS: readonly OptionFormat[] = ['json', 'csv', 'html', 'txt', 'pdf'];
@@ -258,6 +278,9 @@ const normalizeOptions = (raw: LegacyOptions, defaults: Options = DEFAULT_OPTION
   }
   if (typeof merged.diagLogPersist !== 'boolean') {
     merged.diagLogPersist = defaults.diagLogPersist;
+  }
+  if (!isValidMcpBridgeUrl(merged.mcpBridgeUrl)) {
+    merged.mcpBridgeUrl = defaults.mcpBridgeUrl;
   }
   return merged;
 };
