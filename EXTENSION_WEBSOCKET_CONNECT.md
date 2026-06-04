@@ -19,6 +19,8 @@ This document defines scope, protocol, constraints, and acceptance criteria befo
 - Keep protocol explicit, stable, and small.
 - Keep runtime artifacts in memory by default.
 - Treat scope loss as normal lifecycle, not an edge case.
+- Prefer the simplest upstream hook points over broad refactors.
+- If an agreed item conflicts with implementation reality and becomes a blocker, stop and reassess instead of layering fragile workarounds.
 
 ## 3) Scope (In)
 
@@ -162,6 +164,12 @@ Unknown `type` values are ignored safely.
 - Stream ends explicitly with `DONE`.
 - Failure ends explicitly with `ERROR`.
 
+V1 implementation note:
+
+- The existing upstream scrape path yields a complete snapshot result before iteration.
+- V1 chunking is transport-level paging over that in-memory snapshot.
+- True end-to-end upstream pagination/streaming is deferred as a future optimization.
+
 ### 9.5 Cancellation and Busy
 
 - Bridge may send `CANCEL` for active request.
@@ -174,6 +182,7 @@ Unknown `type` values are ignored safely.
 - `CONTEXT_LOST` means transport is still connected, but bound scope is invalid.
 - On `CONTEXT_LOST`, extension stops streaming, clears in-memory iterator/request state, updates UI to degraded-but-connected, and waits for explicit rebind/restart.
 - Bridge treats `CONTEXT_LOST` as non-fatal and idempotent (restart from clean baseline).
+- Scope loss detection may be lazy in v1 (detected when the extension validates scope for the next operation), and is still treated as `CONTEXT_LOST`.
 
 ### 9.6 Terminal Signals
 
@@ -265,6 +274,8 @@ Implementation discipline for mergeability:
 
 - Isolate WebSocket/session state logic in dedicated module(s) with thin integration points.
 - Keep churn in existing hotspots (`background.ts`, `App.svelte`) minimal and additive.
+- Choose strategic injection/hook points so only the minimal required upstream functions are touched.
+- Avoid exporting or reshaping broad internal surfaces unless a narrow blocker requires it.
 
 No bridge/server/MCP backend code is added to this repository.
 
@@ -291,6 +302,8 @@ No bridge/server/MCP backend code is added to this repository.
 - Feature remains isolated behind explicit Connect MCP action.
 - If regressions appear, MCP connectivity can be disabled without touching export path.
 - No migration of existing storage keys required; additive option only.
+- When implementation reality conflicts with plan aspirations, park non-blocking items as deferred improvements.
+- If a conflict is blocking and requires high-risk bandaids, stop implementation and reassess scope/design.
 
 ## 17) Deferred Items (Future, Not v1)
 
