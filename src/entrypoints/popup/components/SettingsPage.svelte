@@ -50,6 +50,7 @@
   export let pdfShowPageNumbers = true;
   export let pdfIncludeAvatars = true;
   export let imageFetchFallback = false;
+  export let mcpBridgeUrl = 'ws://127.0.0.1:8765/ws';
 
   const dispatch = createEventDispatcher<{
     back: void;
@@ -62,6 +63,7 @@
     pdfShowPageNumbersChange: boolean;
     pdfIncludeAvatarsChange: boolean;
     imageFetchFallbackChange: boolean;
+    mcpBridgeUrlChange: string;
     replayTour: void;
     openDiagnostics: void;
   }>();
@@ -150,6 +152,12 @@
       imageFetchFallbackBusy = false;
     }
   }
+
+  function onMcpBridgeUrlChange(e: Event) {
+    const value = (e.target as HTMLInputElement).value.trim();
+    if (!value) return;
+    dispatch('mcpBridgeUrlChange', value);
+  }
 </script>
 
 <div class="settings-page">
@@ -196,6 +204,25 @@
         <Moon size={16} /> {t('settings.theme.dark', {}, lang)}
       </button>
     </div>
+  </div>
+
+  <!-- MCP bridge URL card. Minimal v1 settings surface: endpoint only. -->
+  <div class="card settings-card">
+    <div class="card-header">
+      <span class="card-icon"><ExternalLink size={16} /></span>
+      <span class="card-title">{t('settings.mcpBridgeUrl', {}, lang) || 'MCP bridge URL'}</span>
+    </div>
+    <div class="settings-subtitle">{t('settings.mcpBridgeUrl.hint', {}, lang) || 'Local WebSocket endpoint used by Connect MCP.'}</div>
+    <input
+      class="after-export-select"
+      type="text"
+      value={mcpBridgeUrl}
+      spellcheck="false"
+      autocapitalize="off"
+      autocomplete="off"
+      on:change={onMcpBridgeUrlChange}
+      on:blur={onMcpBridgeUrlChange}
+    />
   </div>
 
   <!-- After export card -->
