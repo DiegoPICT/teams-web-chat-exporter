@@ -5,6 +5,10 @@
 # Dependencies
 node_modules/
 
+# Lockfiles/artifacts for package managers not used here
+package-lock.json
+npm-shrinkwrap.json
+
 # Vendored at install time from @twemoji/svg via scripts/vendor-twemoji.mjs.
 # Don't commit — that's what the postinstall script is for.
 src/public/twemoji/
