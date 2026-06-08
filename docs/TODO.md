@@ -6,6 +6,7 @@
 - [ ] Add unit tests for utility and builder modules.
 - [ ] Add popup UI tests.
 - [ ] Add content-script tests with mocked DOM.
+- [ ] MCP connection reliability (parked for now): keep manual reconnect as the active workflow, and later add optional auto-reconnect with bounded exponential backoff for transient socket closes (e.g. 1001/1006/1012).
 - [ ] Improve handling when long exports stall (the existing `fetchPageWithRetry` covers transient 403/429/5xx; this would be a separate watchdog for the case where the API keeps returning 200s but no progress is made).
 - [ ] Add participant filtering (export only messages from selected authors).
 - [ ] Add user-configurable image-fetch domain allowlist (currently hardcoded in `src/content/attachments.ts`).
