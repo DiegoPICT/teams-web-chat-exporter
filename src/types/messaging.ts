@@ -18,6 +18,8 @@ export type McpStatusPayload = {
   state: McpConnectionState;
   bridgeUrl: string;
   connected: boolean;
+  protocol?: string;
+  extensionVersion?: string;
   sessionId?: string;
   tabId?: number;
   conversationId?: string;
