@@ -523,6 +523,15 @@ function defaultContextError(options: ScrapeOptions) {
 
 const MCP_PROTOCOL_ID = 'teams-exporter-bridge/v1';
 const MCP_CHUNK_SIZE = 200;
+const MCP_LOGS_DEFAULT_LIMIT = 100;
+const MCP_LOGS_MAX_LIMIT = 500;
+const MCP_EXTENSION_VERSION = (() => {
+    try {
+        return chrome.runtime.getManifest()?.version || 'unknown';
+    } catch {
+        return 'unknown';
+    }
+})();
 type McpActiveOp = { requestId: string; type: 'LIST_CONVERSATIONS' | 'START_SNAPSHOT'; cancelled: boolean };
 type McpBridgeFrame = {
     v?: string;
@@ -558,6 +567,8 @@ function getMcpStatusPayload(): McpStatusPayload {
         state: mcpState,
         bridgeUrl: mcpBridgeUrl,
         connected: mcpSocket?.readyState === WebSocket.OPEN,
+        protocol: MCP_PROTOCOL_ID,
+        extensionVersion: MCP_EXTENSION_VERSION,
         sessionId: mcpSessionId || undefined,
         tabId: mcpBoundTabId ?? undefined,
         conversationId: mcpBoundConversationId || undefined,
@@ -608,6 +619,50 @@ function mcpSendFrame(type: string, requestId?: string, payload?: unknown, error
 function mcpSendError(requestId: string | undefined, message: string, code?: string) {
     const payload = code ? { code } : undefined;
     mcpSendFrame('ERROR', requestId, payload, message);
+}
+
+function sanitizeMcpLogLine(raw: string): string {
+    // Minimal redaction pass for obvious token-like artifacts in log lines.
+    // Keep this intentionally conservative to avoid mangling useful context.
+    return raw
+        .replace(/(authorization\s*:\s*bearer\s+)[A-Za-z0-9\-_.~+/]+=*/ig, '$1[REDACTED]')
+        .replace(/(token=)[A-Za-z0-9\-_.~+/]+=*/ig, '$1[REDACTED]')
+        .replace(/(skypetoken=)[A-Za-z0-9\-_.~+/]+=*/ig, '$1[REDACTED]');
+}
+
+function handleMcpGetLogs(requestId?: string, payload?: unknown) {
+    const req = (payload && typeof payload === 'object') ? payload as Record<string, unknown> : {};
+    const rawLimit = typeof req.limit === 'number' ? req.limit : MCP_LOGS_DEFAULT_LIMIT;
+    const finiteLimit = Number.isFinite(rawLimit) ? Math.floor(rawLimit) : MCP_LOGS_DEFAULT_LIMIT;
+    const limit = Math.max(1, Math.min(MCP_LOGS_MAX_LIMIT, finiteLimit));
+    const rawLevels = Array.isArray(req.levels) ? req.levels : [];
+    const levels = new Set(
+        rawLevels
+            .filter((v): v is string => typeof v === 'string' && !!v.trim())
+            .map(v => v.trim().toLowerCase()),
+    );
+
+    const source = levels.size > 0
+        ? diagLogBuffer.filter(e => levels.has(String(e.level || '').toLowerCase()))
+        : diagLogBuffer;
+    const selected = source.slice(-limit);
+    const entries = selected.map(e => ({
+        ts: e.ts,
+        src: e.src,
+        level: e.level,
+        line: sanitizeMcpLogLine(e.line),
+    }));
+
+    mcpSendFrame('LOGS_RESULT', requestId, {
+        entries,
+        returned: entries.length,
+        totalAvailable: source.length,
+        limit,
+    });
+}
+
+function handleMcpHealth(requestId?: string) {
+    mcpSendFrame('HEALTH_RESULT', requestId, getMcpStatusPayload());
 }
 
 async function isMcpScopeValid(): Promise<boolean> {
@@ -802,6 +857,14 @@ function handleMcpSocketMessage(raw: unknown) {
         void handleMcpListConversations(requestId);
         return;
     }
+    if (type === 'HEALTH') {
+        handleMcpHealth(requestId);
+        return;
+    }
+    if (type === 'GET_LOGS') {
+        handleMcpGetLogs(requestId, frame.payload);
+        return;
+    }
     if (type === 'START_SNAPSHOT') {
         void handleMcpStartSnapshot(requestId, frame.payload);
         return;
@@ -842,6 +905,7 @@ async function connectMcpBridge(bridgeUrl: string, tabId: number, conversationId
                 ts: Date.now(),
                 payload: {
                     protocol: MCP_PROTOCOL_ID,
+                    extensionVersion: MCP_EXTENSION_VERSION,
                     tabId,
                     conversationId,
                     conversationTitle: conversationTitle || undefined,
