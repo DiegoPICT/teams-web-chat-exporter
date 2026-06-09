@@ -3,6 +3,9 @@
 This document captures MCP-extension gaps discovered after shipping v1 on
 `exporter-live-MCP`.
 
+Implementation delta summary for this branch is tracked in
+`EXTENSION_MCP_IMPROVEMENTS.md`.
+
 Decision for the next cycle: keep v2 additive and minimal, and avoid broad
 state-machine churn in upstream-critical paths.
 

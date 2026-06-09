@@ -1,232 +1,181 @@
-# Extension v2 Implementation Plan (MCP)
+# Extension v2 Implementation Plan (Two Remaining Features)
 
-This plan translates `EXTENSIONSv2.md` into concrete implementation steps
-using the current codebase on `exporter-live-MCP`.
+This plan implements only the remaining v2 feature intents in
+`V2_FEATURE_INTENTS.md` with additive, minimal, upstream-respectful changes.
 
-Primary constraint: keep changes additive and minimal to upstream-critical
-paths (`background.ts`, popup MCP controls, existing scrape pipeline).
-
-## 1) Scope for This Cycle
+## Scope
 
 In scope:
 
-- Targeted snapshot semantics for `START_SNAPSHOT` (`conversationId` handling)
-- MCP-accessible diagnostic logs (`GET_LOGS` / `LOGS_RESULT`)
-- Guardrailed generic pass-through fetch (`API_CALL` / `API_RESULT`)
+- Feature 1: deterministic chat targeting for `START_SNAPSHOT`
+- Feature 2: generic Teams API transaction (`API_CALL` / `API_RESULT`)
+
+Already delivered (not part of this plan):
+
+- `GET_LOGS` / `LOGS_RESULT`
+- `HEALTH` / `HEALTH_RESULT`
 
 Out of scope (parked):
 
-- Auto-reconnect loop
-- Proactive context sync push frames
+- Auto-reconnect and lifecycle tuning
+- Proactive context push frames
+- Queueing / iterator redesign
 
-## 2) Current Hooks We Reuse (No New Scraper Architecture)
+## Non-Negotiable Implementation Principles
 
-### A. MCP transport and operation dispatch
+- Additive protocol evolution only; no breaking v1 behavior.
+- Minimal touch set; avoid broad refactors.
+- Keep MCP single-operation `BUSY` model unchanged.
+- Deterministic behavior over heuristics.
+- No bridge-policy duplication in extension (bridge is primary guardrail).
+- No popup UX churn unless strictly required (none expected here).
 
-- `src/entrypoints/background.ts`
-  - MCP frame routing: `handleMcpSocketMessage`
-  - MCP operations: `handleMcpListConversations`, `handleMcpStartSnapshot`
-  - status/state: `McpConnectionState`, `getMcpStatusPayload`, `setMcpState`
+## Current Hooks We Reuse
 
-### B. Conversation-targeted scraping already exists
+- MCP frame dispatch and operation lifecycle in `src/entrypoints/background.ts`.
+- Existing targeted scrape hook: `ScrapeOptions.conversationId`.
+- Existing wrong-target safety: `ScrapeOptions.noDomFallback`.
+- Existing content runtime bridge (`runtime.onMessage`) in
+  `src/entrypoints/content.ts`.
+- Existing API auth/discovery primitives in `src/content/api-client.ts`.
 
-- `src/types/shared.ts`
-  - `ScrapeOptions.conversationId?: string | null`
-  - `ScrapeOptions.noDomFallback?: boolean`
-- `src/entrypoints/content.ts`
-  - passes `conversationId` to `apiScrape(...)`
-  - supports `noDomFallback` guard
-- `src/content/api-client.ts`
-  - `apiScrape(..., { conversationId })` prefers explicit target id
+## Feature 1 Plan: Deterministic `START_SNAPSHOT`
 
-### C. Logs already captured internally
+### Intent Mapping
 
-- `src/entrypoints/background.ts`
-  - merged diagnostics buffer is already available for popup diagnostics
-  - existing message handlers: `GET_DIAGNOSTICS_BG`, `DIAG_LOG_FORWARD`, etc.
+- Targeted mode: `payload.conversationId` provided -> stream exactly that chat.
+- Active mode: `payload.conversationId` omitted -> stream current GUI chat.
+- No silent fallback from targeted -> active.
 
-### D. Network fetch baseline exists
+### Implementation Steps
 
-- background already handles `FETCH_BLOB` and `FETCH_BLOB_DIRECT` with timeout,
-  error mapping, and size checks. This gives us patterns for constrained I/O.
+1. In `handleMcpStartSnapshot`, parse optional `payload.conversationId` and
+   optional `payload.conversationTitle`.
+2. Compute effective target:
+   - targeted mode -> use requested id directly,
+   - active mode -> resolve current GUI chat via existing `getConvIdForTab`.
+3. Build `ScrapeOptions` with effective `conversationId`.
+4. Set `noDomFallback: true` in targeted mode to prevent silent drift to active
+   GUI chat when API path fails.
+5. Emit `SNAPSHOT_STARTED` using effective id/title as source of truth.
+6. Return deterministic terminal errors for invalid/unreachable targets.
 
-## 3) Design Principles for v2 Changes
+### Error Semantics
 
-- Additive-only protocol changes; do not break v1 bridge clients.
-- No broad refactors in scraper/content architecture.
-- Keep MCP single-operation model (`BUSY`) unchanged.
-- Prefer explicit, deterministic errors over implicit fallback behavior.
-- Reuse existing options/types/storage model; avoid new persistent state unless
-  unavoidable.
+- `BUSY`: concurrent operation attempted.
+- `CONTEXT_LOST`: tab/scope no longer valid.
+- `NOT_FOUND` (or equivalent mapped error): requested chat does not resolve.
+- `UNSUPPORTED`: invalid frame/parameter shape.
 
-## 4) Protocol Changes
+### Minimal-Churn Notes
 
-Keep protocol id at v1 for compatibility initially, while introducing optional
-new frame types that v1 clients can ignore safely. Move to `/v2` only if a
-breaking semantic change is required.
+- No tab-switch automation.
+- No DOM navigation logic.
+- No new popup behavior required.
 
-New/updated frames:
+## Feature 2 Plan: Generic `API_CALL` / `API_RESULT`
 
-- Request: `START_SNAPSHOT` payload may include `conversationId`.
-- Response on mismatch: `ERROR` with `{ code: 'CONTEXT_MISMATCH' }`.
-- Request: `GET_LOGS` payload `{ limit?: number, levels?: string[] }`.
-- Response: `LOGS_RESULT` payload `{ entries: [...] }`.
-- Request: `API_CALL` payload:
-  - `method`
-  - `endpoint` (relative path only)
+### Intent Mapping
+
+- Bridge sends generic API requests; extension executes authenticated in-page
+  calls and returns raw result/status/error deterministically.
+
+### Contract
+
+- Request frame: `API_CALL`
+  - `method` (not restricted to GET-only)
+  - `endpoint`
   - optional `query`
   - optional `body`
-- Response: `API_RESULT` payload:
+- Response frame: `API_RESULT`
   - `status`
-  - `data` (parsed JSON when possible)
-  - `error` (structured)
+  - `data`
+  - `error`
 
-## 5) Workstream A: `START_SNAPSHOT` Target Semantics
+### Extension-Side Guardrails (Basic by Design)
 
-### Goal
+- Payload shape validation.
+- Method normalization and rejection of empty/invalid method.
+- Request timeout cap.
+- Response size cap (stability guard).
+- Deterministic structured errors.
 
-Prevent silent mismatch between requested conversation and streamed result.
+The extension does not attempt to replicate bridge policy decisions; it only
+enforces runtime correctness and stability.
 
-### Minimal implementation sequence
+### Implementation Steps
 
-1. Parse optional `payload.conversationId` in `handleMcpStartSnapshot`.
-2. If absent, keep current behavior (bound conversation).
-3. If present and different from bound conversation:
-   - return `ERROR` `CONTEXT_MISMATCH` (first step), OR
-   - if enabled by flag, run scrape using requested id.
-4. When scraping by explicit requested id, set `noDomFallback: true` so API
-   failure does not scrape active UI chat by accident.
-5. Ensure `SNAPSHOT_STARTED` echoes the actual conversation id used.
+1. Add `API_CALL` handling in background MCP frame router.
+2. Reuse single-operation busy gate.
+3. Forward validated API request to content script via runtime message
+   (new narrow message type).
+4. In content layer, add one small execution path that reuses existing
+   auth/discovery primitives from `api-client.ts`.
+5. Normalize content response to `API_RESULT` with stable shape.
+6. Map malformed payload/runtime failures to deterministic `ERROR`/`API_RESULT.error`.
 
-### Why this is minimal
+### Minimal-Churn Notes
 
-- Uses existing `conversationId` hook already threaded to API scrape.
-- Avoids any UI tab switching, DOM navigation, or new content-script channels.
-- Keeps MCP operation model intact.
+- No new transport channel.
+- No new persistence state.
+- No popup changes.
 
-### Edge cases
+## File Touch Plan (Minimal)
 
-- Empty or non-string requested id -> treat as absent.
-- Unknown/unavailable conversation -> return existing scrape error mapping.
-- Cancel path remains unchanged.
-
-## 6) Workstream B: `GET_LOGS` over MCP
-
-### Goal
-
-Expose extension-side diagnostics to bridge clients without opening DevTools.
-
-### Minimal implementation sequence
-
-1. Extend MCP frame router to accept `GET_LOGS`.
-2. Reuse existing in-memory diagnostic buffer as the data source.
-3. Apply a strict cap:
-   - default limit (e.g., 100)
-   - hard max (e.g., 500)
-4. Optionally filter by level when provided.
-5. Emit `LOGS_RESULT` with a compact entry shape:
-   - `ts`, `level`, `src`, `line`
-6. Return `ERROR` on malformed payload only; otherwise tolerate missing fields.
-
-### Security and privacy guardrails
-
-- Do not include storage snapshots or environment dumps in this frame.
-- Keep to recent line entries only.
-- Optionally redact obvious bearer/token substrings before emission.
-
-## 7) Workstream C: Guardrailed `API_CALL`
-
-### Goal
-
-Allow bridge evolution without adding one hardcoded MCP operation per endpoint.
-
-### Minimal implementation sequence
-
-1. Add `API_CALL` handler in background MCP router.
-2. Validate payload strictly:
-   - `method` initially `GET` only
-   - `endpoint` must be relative (no absolute URL)
-3. Resolve endpoint against allowlisted base(s) already known in runtime
-   context (Teams chat service origin discovered by existing flow).
-4. Execute fetch with:
-   - timeout
-   - response size cap
-   - JSON parse best-effort (fallback to text)
-5. Return `API_RESULT` with normalized error details.
-
-### Required constraints (non-negotiable)
-
-- Host allowlist, not user-provided arbitrary domains.
-- Endpoint-prefix allowlist, not free-form pathing.
-- No custom auth headers accepted from bridge payload.
-- Concurrency remains single active MCP operation.
-
-### Rollout strategy
-
-- Stage 1: read-only endpoints needed by bridge today.
-- Stage 2: expand allowlist only when a concrete use case is validated.
-
-## 8) Files Expected to Change (Minimal Touch Set)
+Primary:
 
 - `src/entrypoints/background.ts`
-  - MCP frame router + operation handlers
-  - START_SNAPSHOT target semantics
-  - `GET_LOGS` and `API_CALL` handlers
-- `src/types/messaging.ts`
-  - MCP frame payload/result typing updates where applicable
-- `WEBSOCKET.md` (optional)
-  - index update if new MCP frames are documented locally
-- `EXTENSIONSv2.md`
-  - scope/parking decisions (already updated)
-
-Avoid changes unless required:
-
+  - `START_SNAPSHOT` deterministic mode logic
+  - `API_CALL` frame handler and orchestration
 - `src/entrypoints/content.ts`
+  - one new runtime message branch for API execution
 - `src/content/api-client.ts`
-- popup UI components
+  - one small helper exported for generic API execution
+- `src/types/messaging.ts`
+  - additive typing for new runtime message and result shapes
 
-## 9) Acceptance Criteria
+Optional docs update after implementation:
 
-### A. Snapshot target correctness
+- `WEBSOCKET.md` (brief index/reference refresh)
 
-- A request with `conversationId != boundConversationId` never silently returns
-  a different chat.
-- If mismatch mode is reject-first, returns `ERROR` `CONTEXT_MISMATCH`.
+## Rollout Sequence (Avoid Band-Aiding)
 
-### B. Logs over MCP
+1. Implement Feature 1 fully (targeted + active mode) and verify determinism.
+2. Implement Feature 2 with basic extension rails and stable contract.
+3. Run full validation once; avoid iterative hotfix churn by locking contract
+   examples before merge.
 
-- `GET_LOGS` returns bounded recent logs with stable schema.
-- Invalid payload does not crash socket handler.
+## Acceptance Criteria
 
-### C. API pass-through safety
+Feature 1:
 
-- Non-allowlisted targets are rejected.
-- Large/slow responses return structured timeout/size errors.
-- No arbitrary header injection from bridge payload.
+- Targeted mode returns `SNAPSHOT_STARTED.conversationId == requested` or
+  explicit terminal error.
+- Active mode resolves and reports current GUI-selected chat.
+- No targeted->active silent fallback.
 
-## 10) Verification Plan
+Feature 2:
 
-Manual protocol checks (bridge-side):
+- Valid request returns deterministic `API_RESULT` (`status`, `data`, `error`).
+- Invalid request returns deterministic error with reason.
+- Non-GET methods are supported by contract (not artificially blocked).
 
-1. Connect MCP and send `START_SNAPSHOT` with a different `conversationId`.
-2. Confirm deterministic mismatch behavior.
-3. Send `GET_LOGS` and verify capped entries.
-4. Send valid and invalid `API_CALL` requests.
-5. Confirm `BUSY` gate still prevents parallel operations.
+System:
 
-Repo checks after code changes:
+- Existing MCP connect/disconnect/status flows remain intact.
+- Single-operation `BUSY` semantics remain unchanged.
 
-- `pnpm check`
+## Verification Checklist
+
+Bridge-side protocol checks:
+
+1. `START_SNAPSHOT` targeted with valid id.
+2. `START_SNAPSHOT` targeted with invalid id.
+3. `START_SNAPSHOT` active mode with omitted id.
+4. `API_CALL` success and failure cases across multiple HTTP methods.
+5. Request correlation correctness via `requestId`.
+
+Repo checks:
+
 - `pnpm build`
 - `pnpm build:firefox`
-
-## 11) Defer List (Explicit)
-
-Still parked after this plan:
-
-- socket auto-reconnect loop
-- context-change push frames (`CONTEXT_UPDATED`)
-- operation queueing and pull-iterator flow
-
-These remain parked until we intentionally take on lifecycle/state-machine
-complexity in a dedicated reliability phase.
