@@ -6,6 +6,45 @@ export type PingSWResponse = { ok: boolean; now: number };
 export type GetExportStatusRequest = { type: 'GET_EXPORT_STATUS'; tabId?: number | null };
 export type GetExportStatusResponse = { active: boolean; info?: { startedAt?: number | string; lastStatus?: ExportStatusPayload } };
 
+export type McpConnectionState =
+  | 'DISCONNECTED'
+  | 'CONNECTING'
+  | 'CONNECTED_IDLE'
+  | 'BUSY'
+  | 'CONTEXT_LOST'
+  | 'ERROR';
+
+export type McpStatusPayload = {
+  state: McpConnectionState;
+  bridgeUrl: string;
+  connected: boolean;
+  protocol?: string;
+  extensionVersion?: string;
+  sessionId?: string;
+  tabId?: number;
+  conversationId?: string;
+  conversationTitle?: string;
+  lastError?: string;
+};
+
+export type McpConnectRequest = {
+  type: 'MCP_CONNECT';
+  data: {
+    tabId?: number | null;
+    conversationId?: string | null;
+    conversationTitle?: string | null;
+    bridgeUrl?: string | null;
+  };
+};
+export type McpConnectResponse = { ok: boolean; status: McpStatusPayload; error?: string };
+
+export type McpDisconnectRequest = { type: 'MCP_DISCONNECT' };
+export type McpDisconnectResponse = { ok: boolean; status: McpStatusPayload; error?: string };
+
+export type McpStatusRequest = { type: 'MCP_STATUS' };
+export type McpStatusResponse = { ok: true; status: McpStatusPayload };
+export type McpStatusUpdateMessage = { type: 'MCP_STATUS_UPDATE'; payload: McpStatusPayload };
+
 export type StartExportRequest = {
   type: 'START_EXPORT';
   data: {
@@ -222,6 +261,9 @@ export type ExportStatusUpdateMessage = { type: 'EXPORT_STATUS_UPDATE'; payload:
 export type RuntimeRequest =
   | PingSWRequest
   | GetExportStatusRequest
+  | McpConnectRequest
+  | McpDisconnectRequest
+  | McpStatusRequest
   | StartExportRequest
   | StartBundleExportRequest
   | StopExportRequest
@@ -236,6 +278,9 @@ export type RuntimeRequest =
 export type BackgroundIncomingMessage =
   | PingSWRequest
   | GetExportStatusRequest
+  | McpConnectRequest
+  | McpDisconnectRequest
+  | McpStatusRequest
   | StartExportRequest
   | StartBundleExportRequest
   | StopExportRequest
@@ -256,6 +301,9 @@ export type BackgroundIncomingMessage =
 export type RuntimeResponse<T extends RuntimeRequest> =
   T extends PingSWRequest ? PingSWResponse :
   T extends GetExportStatusRequest ? GetExportStatusResponse :
+  T extends McpConnectRequest ? McpConnectResponse :
+  T extends McpDisconnectRequest ? McpDisconnectResponse :
+  T extends McpStatusRequest ? McpStatusResponse :
   T extends StartExportRequest ? StartExportResponse :
   T extends StartBundleExportRequest ? StartBundleExportResponse :
   T extends StopExportRequest ? StopExportResponse :

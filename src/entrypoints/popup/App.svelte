@@ -48,6 +48,14 @@
   import type {
     GetExportStatusRequest,
     GetExportStatusResponse,
+    McpConnectRequest,
+    McpConnectResponse,
+    McpConnectionState,
+    McpDisconnectRequest,
+    McpDisconnectResponse,
+    McpStatusPayload,
+    McpStatusRequest,
+    McpStatusResponse,
     PingSWRequest,
     StartExportRequest,
     StartExportResponse,
@@ -74,6 +82,7 @@
   import OnboardingOverlay from "./components/OnboardingOverlay.svelte";
   import ReviewPrompt from "./components/ReviewPrompt.svelte";
   import ConversationPicker from "./components/ConversationPicker.svelte";
+  import ConnectMcpButton from "./components/ConnectMcpButton.svelte";
   import { t, setLanguage, getLanguage } from "../../i18n/i18n";
 
   const runtime =
@@ -589,6 +598,12 @@
   // or idle) the user doesn't see a brief wrong-state flash.
   let statusKnown = false;
   let currentTabId: number | null = null;
+  let mcpStatus: McpStatusPayload = {
+    state: 'DISCONNECTED',
+    bridgeUrl: options.mcpBridgeUrl,
+    connected: false,
+  };
+  let mcpActionBusy = false;
   let startedAtMs: number | null = null;
   let elapsedTimer: ReturnType<typeof setInterval> | null = null;
   let exportSummary = "";
@@ -1023,6 +1038,67 @@
       ),
     ]);
 
+  const refreshMcpStatus = async () => {
+    try {
+      const resp: McpStatusResponse = await runtimeSend<McpStatusRequest>(runtime, { type: 'MCP_STATUS' });
+      if (!alive || !resp?.ok) return;
+      mcpStatus = resp.status;
+    } catch {
+      // best-effort status polling
+    }
+  };
+
+  const connectMcp = async () => {
+    if (!alive || mcpActionBusy) return;
+    if (!selectedConversationId) {
+      showErrorBanner(t('mcp.errors.needsSelection', {}, currentLang()) || 'Select exactly one conversation before connecting MCP.');
+      return;
+    }
+    try {
+      const tab = await getActiveTeamsTab();
+      if (!alive) return;
+      mcpActionBusy = true;
+      hideErrorBanner(true);
+      const selected = conversations.find(c => c.id === selectedConversationId);
+      const conversationTitle = selected
+        ? conversationDisplayName(selected, options.lang || 'en', t)
+        : null;
+      const resp: McpConnectResponse = await runtimeSend<McpConnectRequest>(runtime, {
+        type: 'MCP_CONNECT',
+        data: {
+          tabId: tab.id,
+          conversationId: selectedConversationId,
+          conversationTitle,
+          bridgeUrl: options.mcpBridgeUrl,
+        },
+      });
+      if (!resp?.ok) {
+        showErrorBanner(resp?.error || t('mcp.errors.connectFailed', {}, currentLang()) || 'Could not connect MCP bridge.');
+      }
+      if (resp?.status) mcpStatus = resp.status;
+    } catch (e: any) {
+      showErrorBanner(e?.message || t('mcp.errors.connectFailed', {}, currentLang()) || 'Could not connect MCP bridge.');
+    } finally {
+      mcpActionBusy = false;
+      void refreshMcpStatus();
+    }
+  };
+
+  const disconnectMcp = async () => {
+    if (!alive || mcpActionBusy) return;
+    try {
+      mcpActionBusy = true;
+      const resp: McpDisconnectResponse = await runtimeSend<McpDisconnectRequest>(runtime, { type: 'MCP_DISCONNECT' });
+      if (!resp?.ok && resp?.error) showErrorBanner(resp.error);
+      if (resp?.status) mcpStatus = resp.status;
+    } catch (e: any) {
+      showErrorBanner(e?.message || t('mcp.errors.disconnectFailed', {}, currentLang()) || 'Could not disconnect MCP bridge.');
+    } finally {
+      mcpActionBusy = false;
+      void refreshMcpStatus();
+    }
+  };
+
   const handleExportStatus = (msg: ExportStatusMsg) => {
     const langNow = currentLang();
     const tabId = msg?.tabId;
@@ -1117,6 +1193,10 @@
   };
 
   const onRuntimeMessage = (msg: any) => {
+    if (msg?.type === 'MCP_STATUS_UPDATE' && msg?.payload) {
+      mcpStatus = msg.payload as McpStatusPayload;
+      return;
+    }
     // Count EXPORT_STATUS / EXPORT_PROGRESS / SCRAPE_PROGRESS arrivals so
     // __reportExportStatusRate can log the per-second rate. A high rate
     // (> ~50/s) during a bundle export points at a broadcast storm — the
@@ -1484,6 +1564,7 @@
       const loaded = await loadStoredOptions();
       if (!alive) return;
       options = loaded;
+      mcpStatus = { ...mcpStatus, bridgeUrl: loaded.mcpBridgeUrl };
       __popupTrace('options-loaded');
       // Reconcile imageFetchFallback with the live <all_urls>
       // permission state on every popup open. Both Firefox and Chrome
@@ -1658,6 +1739,7 @@
         // export button renders its real label (idle or busy) from here on.
         if (alive) statusKnown = true;
       }
+      await refreshMcpStatus();
       // Always load history so the dot reflects any entries added while
       // the popup was closed.
       await refreshHistory();
@@ -1724,6 +1806,7 @@
         pdfShowPageNumbers={options.pdfShowPageNumbers}
         pdfIncludeAvatars={options.pdfIncludeAvatars}
         imageFetchFallback={options.imageFetchFallback}
+        mcpBridgeUrl={options.mcpBridgeUrl}
         on:back={() => (showSettings = false)}
         on:themeChange={(e) => updateOption("theme", e.detail)}
         on:langChange={(e) => updateOption("lang", e.detail)}
@@ -1734,6 +1817,7 @@
         on:pdfShowPageNumbersChange={(e) => updateOption("pdfShowPageNumbers", e.detail)}
         on:pdfIncludeAvatarsChange={(e) => updateOption("pdfIncludeAvatars", e.detail)}
         on:imageFetchFallbackChange={(e) => updateOption("imageFetchFallback", e.detail)}
+        on:mcpBridgeUrlChange={(e) => updateOption("mcpBridgeUrl", e.detail)}
         on:replayTour={replayTour}
         on:openDiagnostics={() => { showSettings = false; showDiagnostics = true; }}
       />
@@ -1804,22 +1888,34 @@
         on:collapseChange={(e) => persistPickerCollapsed(e.detail)}
       />
 
-      <!-- Export button — plain in every state. Outcomes live in History page. -->
-      <ExportButton
-        disabled={selectedConversationIds.length === 0}
-        selectionCount={selectedConversationIds.length}
-        {busy}
-        {statusKnown}
-        summary={exportSummary}
-        {phaseLabel}
-        {counterValue}
-        {counterLabel}
-        {segments}
-        flashTrigger={successFlashTrigger}
-        lang={options.lang || "en"}
-        on:run={startExport}
-        on:stop={stopExport}
-      />
+      <div class="primary-actions">
+        <!-- Export button — plain in every state. Outcomes live in History page. -->
+        <ExportButton
+          disabled={selectedConversationIds.length === 0}
+          selectionCount={selectedConversationIds.length}
+          {busy}
+          {statusKnown}
+          summary={exportSummary}
+          {phaseLabel}
+          {counterValue}
+          {counterLabel}
+          {segments}
+          flashTrigger={successFlashTrigger}
+          lang={options.lang || "en"}
+          on:run={startExport}
+          on:stop={stopExport}
+        />
+
+        <ConnectMcpButton
+          inline={true}
+          state={mcpStatus.state as McpConnectionState}
+          disabled={mcpActionBusy || (!mcpStatus.connected && selectedConversationIds.length !== 1)}
+          lang={options.lang || "en"}
+          lastError={mcpStatus.lastError || ''}
+          on:connect={connectMcp}
+          on:disconnect={disconnectMcp}
+        />
+      </div>
 
       {#if reviewPromptEligible}
         <ReviewPrompt
@@ -1900,3 +1996,18 @@
     />
   {/if}
 </div>
+
+<style>
+  .primary-actions {
+    margin-top: 16px;
+    margin-bottom: 12px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    align-items: start;
+  }
+  .primary-actions :global(.export-primary) {
+    margin-top: 0;
+    margin-bottom: 0;
+  }
+</style>
