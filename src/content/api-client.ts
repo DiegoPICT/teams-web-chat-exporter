@@ -89,6 +89,19 @@ export type FetchProgress = {
   messagesSoFar: number;
 };
 
+export type GenericApiCallRequest = {
+  method: string;
+  endpoint: string;
+  query?: Record<string, unknown>;
+  body?: unknown;
+};
+
+export type GenericApiCallResult = {
+  status: number | null;
+  data: unknown;
+  error: { code: string; message: string; status?: number } | null;
+};
+
 // ── Token Extraction ───────────────────────────────────────────────────
 
 // MSAL Browser v4+ encrypts cache entries by default. Each entry is stored as
@@ -1573,6 +1586,149 @@ function buildMessagingHeaders(url: string, token: string): Record<string, strin
     };
   }
   return { 'Authorization': `Bearer ${token}` };
+}
+
+const GENERIC_API_TIMEOUT_MS = 30_000;
+const GENERIC_API_MAX_BYTES = 2 * 1024 * 1024;
+
+function appendQueryParams(url: URL, query: Record<string, unknown>) {
+  for (const [key, value] of Object.entries(query)) {
+    if (value == null) continue;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item == null) continue;
+        url.searchParams.append(key, String(item));
+      }
+      continue;
+    }
+    url.searchParams.set(key, String(value));
+  }
+}
+
+export async function executeTeamsApiCall(req: GenericApiCallRequest): Promise<GenericApiCallResult> {
+  const rawMethod = typeof req?.method === 'string' ? req.method.trim().toUpperCase() : '';
+  const method = rawMethod || 'GET';
+  const rawEndpoint = typeof req?.endpoint === 'string' ? req.endpoint.trim() : '';
+  if (!rawEndpoint) {
+    return {
+      status: null,
+      data: null,
+      error: { code: 'INVALID_REQUEST', message: 'Missing endpoint' },
+    };
+  }
+  if (/^https?:\/\//i.test(rawEndpoint)) {
+    return {
+      status: null,
+      data: null,
+      error: { code: 'INVALID_REQUEST', message: 'Endpoint must be relative' },
+    };
+  }
+
+  try {
+    const skypeToken = await getSkypeToken();
+    if (!skypeToken) {
+      return {
+        status: null,
+        data: null,
+        error: { code: 'NO_SKYPE_TOKEN', message: 'No valid Skype token available' },
+      };
+    }
+    const discovered = await discover(skypeToken);
+    const fallbackToken = discovered.messagingToken || (await getIc3Token()) || undefined;
+    if (!fallbackToken) {
+      return {
+        status: null,
+        data: null,
+        error: { code: 'NO_MESSAGING_TOKEN', message: 'No valid messaging token available' },
+      };
+    }
+
+    const endpoint = rawEndpoint.startsWith('/') ? rawEndpoint : `/${rawEndpoint}`;
+    const url = new URL(endpoint, discovered.chatServiceUrl.endsWith('/') ? discovered.chatServiceUrl : `${discovered.chatServiceUrl}/`);
+    if (req?.query && typeof req.query === 'object' && !Array.isArray(req.query)) {
+      appendQueryParams(url, req.query);
+    }
+
+    const headers = buildMessagingHeaders(url.toString(), fallbackToken);
+    const init: RequestInit = {
+      method,
+      headers,
+      signal: AbortSignal.timeout(GENERIC_API_TIMEOUT_MS),
+    };
+    if (/teams\.live\.com\/api\/chatsvc\/consumer\b/i.test(url.toString())) {
+      init.credentials = 'include';
+    }
+
+    if (req?.body !== undefined && method !== 'GET' && method !== 'HEAD') {
+      const contentTypeKey = Object.keys(headers).find(k => k.toLowerCase() === 'content-type');
+      if (!contentTypeKey) headers['content-type'] = 'application/json';
+      init.body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+    }
+
+    const resp = await fetch(url.toString(), init);
+    const lenHeader = resp.headers.get('content-length');
+    const declaredBytes = lenHeader ? Number(lenHeader) : NaN;
+    if (Number.isFinite(declaredBytes) && declaredBytes > GENERIC_API_MAX_BYTES) {
+      return {
+        status: resp.status,
+        data: null,
+        error: {
+          code: 'RESPONSE_TOO_LARGE',
+          message: `Response exceeds limit (${declaredBytes} bytes > ${GENERIC_API_MAX_BYTES})`,
+          status: resp.status,
+        },
+      };
+    }
+
+    const text = await resp.text();
+    const actualBytes = new TextEncoder().encode(text).byteLength;
+    if (actualBytes > GENERIC_API_MAX_BYTES) {
+      return {
+        status: resp.status,
+        data: null,
+        error: {
+          code: 'RESPONSE_TOO_LARGE',
+          message: `Response exceeds limit (${actualBytes} bytes > ${GENERIC_API_MAX_BYTES})`,
+          status: resp.status,
+        },
+      };
+    }
+
+    const contentType = (resp.headers.get('content-type') || '').toLowerCase();
+    let data: unknown = text;
+    if (contentType.includes('application/json')) {
+      try { data = text ? JSON.parse(text) : null; }
+      catch { data = text; }
+    }
+
+    if (!resp.ok) {
+      return {
+        status: resp.status,
+        data,
+        error: {
+          code: 'HTTP_ERROR',
+          message: `API call failed: ${resp.status} ${resp.statusText}`,
+          status: resp.status,
+        },
+      };
+    }
+
+    return { status: resp.status, data, error: null };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    if ((e as { name?: string })?.name === 'AbortError') {
+      return {
+        status: null,
+        data: null,
+        error: { code: 'TIMEOUT', message: `API call timed out after ${GENERIC_API_TIMEOUT_MS} ms` },
+      };
+    }
+    return {
+      status: null,
+      data: null,
+      error: { code: 'FETCH_FAILED', message },
+    };
+  }
 }
 
 // Combine two AbortSignals so the resulting signal aborts when EITHER

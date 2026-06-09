@@ -532,7 +532,7 @@ const MCP_EXTENSION_VERSION = (() => {
         return 'unknown';
     }
 })();
-type McpActiveOp = { requestId: string; type: 'LIST_CONVERSATIONS' | 'START_SNAPSHOT'; cancelled: boolean };
+type McpActiveOp = { requestId: string; type: 'LIST_CONVERSATIONS' | 'START_SNAPSHOT' | 'API_CALL'; cancelled: boolean };
 type McpBridgeFrame = {
     v?: string;
     type?: string;
@@ -665,26 +665,91 @@ function handleMcpHealth(requestId?: string) {
     mcpSendFrame('HEALTH_RESULT', requestId, getMcpStatusPayload());
 }
 
-async function isMcpScopeValid(): Promise<boolean> {
-    if (mcpBoundTabId == null || !mcpBoundConversationId) return false;
+async function handleMcpApiCall(requestId?: string, payload?: unknown) {
+    if (mcpActiveOperation) {
+        mcpSendError(requestId, 'Another operation is already running', 'BUSY');
+        return;
+    }
+    if (!(await requireMcpTabScope(requestId))) return;
+    const tabId = mcpBoundTabId;
+    if (typeof tabId !== 'number') {
+        mcpSendError(requestId, 'Missing bound tab', 'CONTEXT_LOST');
+        return;
+    }
+
+    const req = (payload && typeof payload === 'object') ? payload as Record<string, unknown> : {};
+    const method = typeof req.method === 'string' ? req.method.trim().toUpperCase() : '';
+    const endpoint = typeof req.endpoint === 'string' ? req.endpoint.trim() : '';
+    if (!method || !endpoint) {
+        mcpSendError(requestId, 'API_CALL requires method and endpoint', 'UNSUPPORTED');
+        return;
+    }
+
+    const query = (req.query && typeof req.query === 'object' && !Array.isArray(req.query))
+        ? req.query as Record<string, unknown>
+        : undefined;
+    const opId = requestId || makeMcpSessionId();
+    mcpActiveOperation = { requestId: opId, type: 'API_CALL', cancelled: false };
+    setMcpState('BUSY');
+
+    try {
+        await ensureContentScript(tabId);
+        const resp = await sendMessageToTab(tabId, {
+            type: 'API_CALL_TEAMS',
+            payload: {
+                method,
+                endpoint,
+                query,
+                body: req.body,
+            },
+        });
+        if (!resp?.ok || !resp?.result) {
+            mcpSendError(requestId, resp?.error || 'API_CALL failed');
+            return;
+        }
+        const result = resp.result as { status?: number | null; data?: unknown; error?: unknown };
+        mcpSendFrame('API_RESULT', requestId, {
+            status: typeof result.status === 'number' || result.status === null ? result.status : null,
+            data: 'data' in result ? result.data : null,
+            error: 'error' in result ? result.error : null,
+        });
+    } catch (e: any) {
+        mcpSendError(requestId, e?.message || String(e));
+    } finally {
+        clearMcpOperation();
+    }
+}
+
+async function isMcpTabScopeValid(): Promise<boolean> {
+    if (mcpBoundTabId == null) return false;
     try {
         const tab = await tabs.get(mcpBoundTabId);
         if (!tab || !isTeamsUrl(tab.url)) return false;
         await ensureContentScript(mcpBoundTabId);
-        const currentConvId = await getConvIdForTab(mcpBoundTabId);
-        return currentConvId === mcpBoundConversationId;
+        return true;
     } catch {
         return false;
     }
 }
 
-async function requireMcpScope(requestId?: string): Promise<boolean> {
-    const ok = await isMcpScopeValid();
+async function requireMcpTabScope(requestId?: string): Promise<boolean> {
+    const ok = await isMcpTabScopeValid();
     if (ok) return true;
     clearMcpOperation();
     setMcpState('CONTEXT_LOST', 'Bound Teams scope is no longer active. Reconnect MCP from the popup.');
     mcpSendError(requestId, 'Bound Teams scope is no longer active', 'CONTEXT_LOST');
     return false;
+}
+
+async function mcpConversationExists(tabId: number, conversationId: string): Promise<boolean> {
+    try {
+        await ensureContentScript(tabId);
+        const resp = await sendMessageToTab(tabId, { type: 'LIST_CONVERSATIONS_QUICK' });
+        if (!resp?.ok || !Array.isArray(resp?.conversations)) return false;
+        return resp.conversations.some((c: any) => c?.id === conversationId);
+    } catch {
+        return false;
+    }
 }
 
 function resetMcpSessionState() {
@@ -725,7 +790,7 @@ async function handleMcpListConversations(requestId?: string) {
         mcpSendError(requestId, 'Another operation is already running', 'BUSY');
         return;
     }
-    if (!(await requireMcpScope(requestId))) return;
+    if (!(await requireMcpTabScope(requestId))) return;
     const tabId = mcpBoundTabId;
     if (typeof tabId !== 'number') {
         mcpSendError(requestId, 'Missing bound tab', 'CONTEXT_LOST');
@@ -757,15 +822,42 @@ async function handleMcpStartSnapshot(requestId?: string, payload?: unknown) {
         mcpSendError(requestId, 'Another operation is already running', 'BUSY');
         return;
     }
-    if (!(await requireMcpScope(requestId))) return;
+    if (!(await requireMcpTabScope(requestId))) return;
     const tabId = mcpBoundTabId;
-    const conversationId = mcpBoundConversationId;
-    if (typeof tabId !== 'number' || !conversationId) {
+    if (typeof tabId !== 'number') {
         mcpSendError(requestId, 'Missing bound Teams scope', 'CONTEXT_LOST');
         return;
     }
 
     const req = (payload && typeof payload === 'object') ? payload as Record<string, unknown> : {};
+    const requestedConversationId = typeof req.conversationId === 'string' && req.conversationId.trim()
+        ? req.conversationId.trim()
+        : null;
+    const targetedMode = !!requestedConversationId;
+    let conversationId: string | null = requestedConversationId;
+    if (!conversationId) {
+        conversationId = await getConvIdForTab(tabId) || null;
+        if (!conversationId) {
+            mcpSendError(requestId, 'No active chat selected in Teams tab', 'CONTEXT_LOST');
+            return;
+        }
+    }
+    if (targetedMode) {
+        const exists = await mcpConversationExists(tabId, conversationId);
+        if (!exists) {
+            mcpSendError(requestId, `Conversation not found: ${conversationId}`, 'NOT_FOUND');
+            return;
+        }
+    }
+
+    const requestedConversationTitle = typeof req.conversationTitle === 'string' && req.conversationTitle.trim()
+        ? req.conversationTitle.trim()
+        : null;
+    const activeConversationTitle = typeof mcpBoundConversationTitle === 'string' && mcpBoundConversationTitle.trim()
+        ? mcpBoundConversationTitle
+        : null;
+    const conversationTitle = requestedConversationTitle || (!targetedMode ? activeConversationTitle : null);
+
     const opId = requestId || makeMcpSessionId();
     mcpActiveOperation = { requestId: opId, type: 'START_SNAPSHOT', cancelled: false };
     setMcpState('BUSY');
@@ -784,7 +876,8 @@ async function handleMcpStartSnapshot(requestId?: string, payload?: unknown) {
             embedAvatars: false,
             downloadImages: false,
             conversationId,
-            conversationTitle: mcpBoundConversationTitle,
+            conversationTitle,
+            noDomFallback: targetedMode,
         };
 
         const scrapeRes = await requestScrape(tabId, scrapeOptions);
@@ -799,7 +892,7 @@ async function handleMcpStartSnapshot(requestId?: string, payload?: unknown) {
             count: messages.length,
             chunks: totalChunks,
             conversationId,
-            conversationTitle: mcpBoundConversationTitle,
+            conversationTitle,
         });
 
         for (let i = 0; i < totalChunks; i++) {
@@ -820,6 +913,8 @@ async function handleMcpStartSnapshot(requestId?: string, payload?: unknown) {
         const message = e?.message || String(e);
         if (message === 'cancelled' || mcpActiveOperation?.cancelled) {
             mcpSendFrame('DONE', requestId, { cancelled: true, reason: 'cancelled' });
+        } else if (targetedMode && /not found|404/i.test(message)) {
+            mcpSendError(requestId, message, 'NOT_FOUND');
         } else {
             mcpSendError(requestId, message);
         }
@@ -863,6 +958,10 @@ function handleMcpSocketMessage(raw: unknown) {
     }
     if (type === 'GET_LOGS') {
         handleMcpGetLogs(requestId, frame.payload);
+        return;
+    }
+    if (type === 'API_CALL') {
+        void handleMcpApiCall(requestId, frame.payload);
         return;
     }
     if (type === 'START_SNAPSHOT') {
