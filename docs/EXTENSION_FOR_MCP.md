@@ -1,5 +1,7 @@
 # Extension for MCP
 
+![Teams Chat MCP panel](../screenshots/teams-chat-mcp.png)
+
 This document describes the extension-side MCP behavior currently implemented in
 this repository.
 
