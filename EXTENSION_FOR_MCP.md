@@ -127,6 +127,43 @@ Core deterministic error codes used by extension-side MCP flow:
   resolved.
 - `UNSUPPORTED` for unsupported frame types or invalid parameter shapes.
 
+## Known issues
+
+- `CANCEL` semantics are currently snapshot-centric. `START_SNAPSHOT` is
+  cancelled explicitly, but non-snapshot operations (including `API_CALL`) may
+  emit a generic cancelled terminal signal while the in-flight operation can
+  still return a result.
+- Active snapshot mode can report a stale `conversationTitle` when the user has
+  switched chats since initial MCP connect.
+- `API_CALL` currently rejects absolute `http(s)://` endpoints, but a protocol-
+  relative endpoint (`//host/path`) can still override host unless explicitly
+  blocked.
+- `API_CALL` is generic in frame shape but currently resolves against chat
+  service discovery/auth flow. It is not yet a multi-service Teams surface.
+- Error taxonomy is deterministic but split between transport-level `ERROR`
+  codes and `API_RESULT.error.code` values.
+- Targeted-conversation precheck (`LIST_CONVERSATIONS_QUICK`) can classify
+  transient data/read failures as `NOT_FOUND`.
+- MCP UI keys currently live in `en.json`; if locale parity is enforced for this
+  feature surface, non-English locale files need synchronized keys.
+
+## TODO
+
+- Normalize `CANCEL` behavior across MCP operations, including deterministic
+  cancel handling for `API_CALL`.
+- Resolve active-mode snapshot titles from current GUI state instead of relying
+  on connect-time title state.
+- Explicitly reject protocol-relative `API_CALL` endpoints (`//...`) and keep
+  endpoint normalization host-stable.
+- Make `API_CALL` service scope explicit in contract/docs, and extend to other
+  Teams service families only when intentionally designed.
+- Consolidate error-code vocabulary so bridge handling is simpler and fully
+  deterministic across frame-level and payload-level failures.
+- Split targeted precheck failures into distinguishable outcomes (not-found vs
+  transient read/runtime failure).
+- Decide and apply locale policy for MCP UI keys (en-only by exception, or full
+  locale parity).
+
 ## Parked items
 
 The following remain intentionally out of scope in the current implementation:
