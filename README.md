@@ -66,3 +66,12 @@ If something is broken, the fastest path is to share a diagnostic report alongsi
 
 > [!IMPORTANT]
 > You are responsible for following your organization's and Microsoft's policies when exporting conversations.
+
+## Disclaimer
+
+This project is provided to work within your existing account/session context.
+You are responsible for using it in a way that does not violate your vendor,
+company, Microsoft, or any other applicable policies, terms, or agreements.
+
+This project is not affiliated with, endorsed by, sponsored by, or otherwise
+officially associated with Microsoft.
