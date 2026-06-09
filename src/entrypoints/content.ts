@@ -12,7 +12,7 @@ import { autoScrollAggregate as autoScrollAggregateHelper } from '../content/scr
 import { extractChatTitle, extractChannelTitle } from '../content/title';
 import { extractAvatarId } from '../utils/avatars';
 import { TEAMS_MATCH_PATTERNS } from '../utils/teams-urls';
-import { apiScrape, discover, ensureSkypeTokenCookies, extractConversationId, fetchSharePointFile, getGraphToken, getIc3Token, getLastApiScrapeFailure, getSkypeToken, listConversationsFromIdb, listConversationsFromIdbQuick } from '../content/api-client';
+import { apiScrape, discover, ensureSkypeTokenCookies, executeTeamsApiCall, extractConversationId, fetchSharePointFile, getGraphToken, getIc3Token, getLastApiScrapeFailure, getSkypeToken, listConversationsFromIdb, listConversationsFromIdbQuick } from '../content/api-client';
 import { convertApiMessages } from '../content/api-converter';
 import { runStandaloneProbes } from '../content/probes';
 import type { ProbeResult } from '../utils/diagnostics';
@@ -3365,6 +3365,28 @@ export default defineContentScript({
                             sendResponse({ ok: true, conversations, folders });
                         } catch (e) {
                             console.log('[Teams Exporter] LIST_CONVERSATIONS failed:', e);
+                            sendResponse({ ok: false, error: String((e as Error)?.message || e) });
+                        }
+                        return;
+                    }
+                    if (msg.type === 'API_CALL_TEAMS') {
+                        try {
+                            const payload = (msg.payload && typeof msg.payload === 'object')
+                                ? msg.payload as { method?: unknown; endpoint?: unknown; query?: unknown; body?: unknown }
+                                : {};
+                            const method = typeof payload.method === 'string' ? payload.method : 'GET';
+                            const endpoint = typeof payload.endpoint === 'string' ? payload.endpoint : '';
+                            const query = (payload.query && typeof payload.query === 'object' && !Array.isArray(payload.query))
+                                ? payload.query as Record<string, unknown>
+                                : undefined;
+                            const result = await executeTeamsApiCall({
+                                method,
+                                endpoint,
+                                query,
+                                body: payload.body,
+                            });
+                            sendResponse({ ok: true, result });
+                        } catch (e) {
                             sendResponse({ ok: false, error: String((e as Error)?.message || e) });
                         }
                         return;
