@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.14] — 2026-06-09
+
+Branch-focused MCP update that adds deterministic targeting and generic API
+transactions while keeping the current minimal, additive extension model.
+
+### Added
+
+- **MCP health transaction with authoritative extension runtime identity.**
+  Added `HEALTH` / `HEALTH_RESULT`. Health/status now includes `protocol` and
+  `extensionVersion` from the loaded extension manifest. `HELLO` payload now
+  includes `extensionVersion` as well, so bridge can verify which extension
+  runtime is actually connected.
+- **MCP log retrieval transaction.** Added `GET_LOGS` / `LOGS_RESULT` for
+  bounded extension-side log retrieval (background + content), with optional
+  filtering and conservative token-shaped redaction.
+- **Generic Teams API transaction.** Added `API_CALL` / `API_RESULT` so the
+  bridge can request authenticated in-page Teams API calls through extension
+  runtime context.
+
+### Changed
+
+- **`START_SNAPSHOT` is now deterministic across targeted and active modes.**
+  When `payload.conversationId` is provided, the snapshot targets that exact
+  chat id; when omitted, it resolves the currently selected GUI chat. The
+  stream start frame (`SNAPSHOT_STARTED`) reports the effective
+  `conversationId` / `conversationTitle` as source of truth.
+- **Targeted snapshots no longer silently drift to active-chat DOM fallback.**
+  Targeted mode uses no-DOM-fallback semantics to prevent wrong-chat exports
+  when API calls fail.
+
+### Parked
+
+- Auto-reconnect reliability loop and proactive context-sync push events remain
+  intentionally out of scope in this update.
+
 ## [1.4.13] — 2026-05-21
 
 GitHub-only release. Not pushed to the Chrome Web Store, Microsoft Edge Add-ons, or Firefox AMO. Existing installs stay on 1.4.12. Users who hit a problem and are asked to share diagnostics can install the unpacked build from this release; everyone else sees no change.

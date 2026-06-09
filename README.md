@@ -62,6 +62,7 @@ If something is broken, the fastest path is to share a diagnostic report alongsi
 - [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md)
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
 - [docs/TODO.md](docs/TODO.md)
+- [EXTENSION_FOR_MCP.md](EXTENSION_FOR_MCP.md)
 
 > [!IMPORTANT]
 > You are responsible for following your organization's and Microsoft's policies when exporting conversations.
